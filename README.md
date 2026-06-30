@@ -1,276 +1,150 @@
-# omp-teleport
+# teleport
 
-`curl | sh` → an OMP agent on a remote machine (Linux, macOS, Windows, Android).
+`curl | sh` — run an AI agent's tools on a remote machine (Linux, macOS, Windows, Android).
 
-omp-teleport lets you drop a one-liner on any Linux/macOS box, then drive
-that box from your local OMP TUI as if OMP were running there. All tool
-calls (`bash`, `read`, `edit`, …) execute on the remote; the model and
-session stay on your machine.
+Drop a one-liner on any box, then drive it from your local harness as if
+the tools were local. All tool calls (`bash`, `read`, `edit`, …) execute
+on the remote; the model and session stay on your machine.
 
 ```
-your OMP TUI  ─►  relay (Bun, local or remote)  ─►  connector (Python, on remote)
-                          ▲
-                          │
-                       MCP server
-                          ▲
-                          │
-                  Claude Code / Codex / anything
+your harness (OMP, Claude Code, …)
+        │
+        ▼
+    relay (Bun)  ◄──── connector (Python, on remote)
+        │
+        ▼
+    MCP server (any MCP-capable client)
 ```
 
 ## What you get
 
-- **One connector script** (Python 3 stdlib, ~700 lines, no deps). Talks
-  WebSocket outbound — works on hosts that only allow egress.
-- **A relay server** (Bun, single binary). Holds the machines, exposes
-  MCP for any harness, and an HTTP API for tighter integrations.
-- **An OMP extension** that registers `remote_bash`, `remote_read`,
-  `remote_write`, `remote_edit`, `remote_glob`, `remote_grep`,
-  `remote_ls`, `remote_stat`, `remote_env` and forwards each call to
-  the relay. Plus a `/tp` slash command for managing machines and
-  tokens, and a live status widget above the editor.
-- **A `omp-teleport` CLI** to manage a separately-run relay (issue
-  tokens, list machines).
-- **An MCP server** at `/mcp` so any MCP-capable harness (Claude Code,
-  Codex CLI, etc.) gets the same tools with zero extra code.
+- **One connector script** — Python 3 stdlib, ~660 lines, zero
+  dependencies. Talks WebSocket outbound, so it works on hosts that
+  only allow egress.
+- **A relay server** — Bun, single binary. Holds connected machines,
+  exposes an HTTP API and a WebSocket endpoint for connectors, and an
+  MCP server for any harness.
+- **An OMP extension** (`agent/omp-teleport.ts`) that registers
+  `remote_bash`, `remote_read`, `remote_write`, `remote_edit`,
+  `remote_glob`, `remote_grep`, `remote_ls`, `remote_stat`,
+  `remote_env` and forwards each call to the relay. Plus `/tp` and
+  `/psh` slash commands and a live status widget above the editor.
+- **A CLI** (`cli/omp-teleport.ts`) to manage a separately-run relay
+  (issue join tokens, list machines, print config).
+- **An MCP server** at `/mcp` (defined but not yet routed) so any
+  MCP-capable harness can get the same tools with zero extra code.
 
-## Quickstart (zero-config)
+## Quickstart
 
-By default, OMP auto-spawns a local relay on first use and tears it
-down with the session. You don't need to install or run anything
-separately:
+By default, the OMP extension auto-spawns a local relay on first use
+and tears it down with the session. No separate install needed.
 
 ```bash
-# Just run omp. The extension spawns a relay on 127.0.0.1:7777
-# bound to 0.0.0.0, with OMP_REMOTE_PUBLIC_URL auto-set to your
-# box's primary network IP.
+# 1. Start omp. The extension spawns a relay on 0.0.0.0:7777.
 omp
 
-# Mint a join token from inside the TUI:
-/tp token my-server
-# → http://45.83.179.102:7777/sh
+# 2. On the remote machine:
+curl -sSL 'http://<your-ip>:7777/sh' | sh -
+
+# 3. Windows (PowerShell, no admin needed):
+irm 'http://<your-ip>:7777/psh' | iex
 ```
 
-Then on the remote machine:
+The relay binds `0.0.0.0:7777` by default. Override with
+`OMP_REMOTE_BIND` or `OMP_REMOTE_PORT`.
+
+### macOS
+
+Standard sh installer works:
 
 ```bash
-curl -sSL 'http://45.83.179.102:7777/sh' | sh -
+curl -sSL 'http://<relay>:7777/sh' | sh -
 ```
 
-The auto-spawned relay binds `0.0.0.0:7777` by default, so the remote
-can reach it on the OMP box's primary IP. The install URL embeds
-that IP via `OMP_REMOTE_PUBLIC_URL` (auto-detected from the box's
-primary IPv4 interface). Override it when the remote is on a
-different network:
+### Android (Termux, no root)
 
 ```bash
-# Example: relay is reachable via a tunnel at https://relay.example.com
-OMP_REMOTE_PUBLIC_URL=https://relay.example.com omp
+# Install Termux from F-Droid, then:
+pkg install python
+curl -sSL 'http://<relay>:7777/sh' | sh -
 ```
 
-The extension spawns the relay by finding `relay/src/index.ts`
-
-### Windows Installation
-
-For Windows machines, use the PowerShell installer:
+### Windows
 
 ```powershell
-# From PowerShell (no admin rights needed):
-irm 'http://45.83.179.102:7777/psh' | iex
+irm 'http://<relay>:7777/psh' | iex
 ```
 
-Or use the `/psh` command in the TUI to get the Windows install URL:
+The PowerShell installer will find an existing Python or download a
+portable one, then download and start the connector. No admin rights
+needed. Requires PowerShell 5.1+ (ships with Windows 10+).
 
-```bash
-/psh          # show Windows install URL
-/psh help     # show detailed help
-```
+### What the install scripts do
 
-The Windows installer will:
-- Download and install a portable Python runtime if Python is not found
-- Download and run the connector
-- Create a persistent connection to the relay
-- Work without administrator privileges
+`/sh` (Linux/macOS/Android):
+1. Creates `~/.omp-teleport/`
+2. Persists the relay URL to `~/.omp-teleport/env`
+3. Downloads `connector.py` from the relay
+4. Starts the connector in the background with `python3` or `python`
+5. Writes a PID file
 
-**Requirements:**
-- Windows 10/11 or Windows Server 2016+
-- PowerShell 5.1+ (included with Windows)
-- No administrator rights required
+`/psh` (Windows):
+1. Creates `%USERPROFILE%\.omp-teleport\`
+2. Persists the relay URL
+3. Checks for `python3`, `python`, or `py` on PATH
+4. If none found, downloads a portable Python embed zip
+5. Downloads `connector.py` from the relay
+6. Starts the connector as a background process
 
-### macOS Installation
+## Slash commands
 
-macOS works with the standard `/sh` installer:
+### `/tp` — manage remote machines
 
-```bash
-curl -sSL 'http://45.83.179.102:7777/sh' | sh -
-```
-
-### Android Installation
-
-Android works via Termux (no root required):
-
-```bash
-# Install Termux from F-Droid (not Play Store)
-# Then in Termux:
-pkg install python
-curl -sSL 'http://45.83.179.102:7777/sh' | sh -
-```
-
-**Requirements:**
-- Termux from F-Droid
-- Python package installed (`pkg install python`)
-- No root required
-relative to the extension file (or via the `OMP_REMOTE_RELAY_ENTRY`
-env var if installed somewhere else). If the relay is already
-running on the configured URL, the extension reuses it instead of
-spawning a new one.
-
-### What you get for free with the default
-
-- **`/tp ls`** — list connected machines in the TUI
-- **`/tp pick`** — interactive machine picker that injects
-  `machine: "<label>" ` into the editor
-- **`/tp token <label> [ttl_sec]`** — mint a join token, print the
-  install URL
-- **`/tp refresh`** — re-poll the machine list
-- **Live status widget** above the editor showing the relay URL and
-  the online/total machine count, updated on every connect/disconnect
-
-## Optional: explicit remote relay
-
-If you'd rather run the relay as a separate service (cloud, shared
-team relay, a long-lived systemd unit), point OMP at it explicitly
-via `OMP_REMOTE_RELAY`. The extension skips auto-spawn when this is
-set.
-
-```bash
-# Set these in your shell (or in ~/.omp/agent/config.yml):
-export OMP_REMOTE_RELAY=https://relay.example.com
-export OMP_REMOTE_TOKEN=ot_xxxxxxxxxxxxxxxx
-omp
-```
-
-To run the relay as a separate process:
-
-```bash
-# In this repo:
-cd relay
-bun install
-bun run src/index.ts
-```
-
-First run prints a bootstrap operator token (also persisted to
-`~/.omp-teleport/state.json`):
-
-```
-created bootstrap operator token: ot_xxxxxxxxxxxxxxxx
-set it as OMP_REMOTE_TOKEN for the OMP extension.
-```
-
-The CLI can mint install URLs against a running relay:
-
-```bash
-OMP_REMOTE_RELAY=http://127.0.0.1:7777 OMP_REMOTE_TOKEN=ot_xxx... \
-  bun cli/omp-teleport.ts install-url prod-db
-# → http://127.0.0.1:7777/sh
-```
-
-`ttl_sec` is optional (default = no expiry; one-shot after first use).
-
-State (tokens, machine list) lives in `~/.omp-teleport/state.json` by
-default; override with `OMP_REMOTE_STATE_DIR`. The relay binds
-`0.0.0.0:7777` by default; override with `OMP_REMOTE_BIND`. The
-default public URL embedded in install scripts is auto-detected from
-the box's primary network IP; override with `OMP_REMOTE_PUBLIC_URL`.
-
-## Plug other harnesses via MCP
-
-Any MCP-capable harness can point at `<relay>/mcp` with
-`Authorization: Bearer ot_xxx…`. Tools appear as
-`<safeLabel>__<tool>`, e.g. `prod_db__bash`. The harness sees
-machines join/leave via `notifications/tools/list_changed` (open the
-SSE listener on the same URL via GET).
-
-## Architecture
-
-```
-connector.py (Python)              relay (Bun)                 harness (OMP, Claude Code, …)
-       │                                │                                 │
-       │   WS /ws/connector             │                                 │
-       │   Sec-WebSocket-Protocol:      │                                 │
-       │     bearer.<join_token>        │                                 │
-       │ ──────────────────────────────►│                                 │
-       │                                │                                 │
-       │   {type:"register",label,…}    │                                 │
-       │ ──────────────────────────────►│                                 │
-       │                                │  MCP initialize                 │
-       │                                │ ◄────────────────────────────── │
-       │                                │  MCP tools/list                 │
-       │                                │ ◄────────────────────────────── │
-       │                                │                                 │
-       │                                │  MCP tools/call                 │
-       │                                │   {name:"prod_db__bash",…}      │
-       │                                │ ◄────────────────────────────── │
-       │   {type:"tool.call",…}         │                                 │
-       │ ◄──────────────────────────────│                                 │
-       │                                │                                 │
-       │   {type:"tool.result",…}       │                                 │
-       │ ──────────────────────────────►│  MCP response                   │
-       │                                │ ──────────────────────────────►│
-```
-
-See `PROTOCOL.md` for the full wire-level spec.
-
-## Wire protocol summary
-
-| Surface | Transport | Format | Auth |
-|---|---|---|---|
-| Connector ↔ relay | WebSocket `/ws/connector` | JSON text frames | `Sec-WebSocket-Protocol: bearer.<jt_…>` (one-shot join token) |
-| Harness ↔ relay | Streamable HTTP `/mcp` | JSON-RPC 2.0 | `Authorization: Bearer <ot_…>` |
-| OMP extension ↔ relay | HTTP `/api/*` | JSON over HTTP | `Authorization: Bearer <ot_…>` |
-
-Tokens:
-- `jt_<base64>` — join token, one-shot, used by the connector
-- `ot_<base64>` — operator token, long-lived, used by harnesses
-
-## Tool surface
-
-The connector implements nine tools, all returning
-`{content: [{type: "text", text: "..."}], isError: bool}`:
-
-| Tool | Args | Result text |
-|---|---|---|
-| `bash` | `command`, `cwd?`, `timeout?` (sec, default 30) | combined stdout+stderr + `[exit: N]` |
-| `read` | `path`, `offset?`, `limit?` (bytes) | file contents (capped at 4MB) |
-| `write` | `path`, `content` | `"wrote N bytes"` |
-| `edit` | `path`, `old_text`, `new_text`, `replace_all?` | `"patched"` |
-| `glob` | `pattern`, `cwd?` | newline-separated paths |
-| `grep` | `pattern`, `path`, `include?`, `max_count?` | `path:line:match` lines |
-| `ls` | `path` | `kind size name` lines |
-| `stat` | `path` | one-line summary |
-| `env` | `name?` | single value or all env |
-
-MCP names are `<safeLabel>__<tool>` (e.g. `prod_db__bash`). OMP
-extension names are flat `remote_<tool>` with a `machine` arg.
-
-## OMP slash commands
-
-| Command | Effect |
+| Subcommand | Effect |
 |---|---|
 | `/tp ls` | list connected machines (marks the active one) |
-| `/tp pick` | interactive machine picker; injects `machine: "<label>" ` into the editor |
-| `/tp token <label> [ttl_sec]` | mint a join token, print the install URL |
-| `/tp refresh` | re-poll `/api/machines` |
+| `/tp pick` | interactive machine picker; enters remote-only mode |
 | `/tp connect <machine>` | enter remote-only mode (hides local filesystem tools; sets active machine) |
 | `/tp disconnect` | exit remote-only mode (restores all local tools) |
+| `/tp refresh` | re-poll the machine list |
+| `/tp restart` | reconnect to the relay |
+| `/tp force [on\|off]` | toggle force mode: use short names (bash, read, etc.) as aliases to remote tools |
+
+### `/psh` — Windows installer info
+
+| Subcommand | Effect |
+|---|---|
+| `/psh` | show the Windows install URL |
+| `/psh url` | same |
+| `/psh help` | show detailed help |
+
 ## CLI
 
 ```bash
-omp-teleport start                            # start the relay in the foreground
-omp-teleport token <label> [ttl_sec]          # mint a join token, print the install URL
-omp-teleport install-url <label> [ttl_sec]    # same as `token` but only print the URL
-omp-teleport ls                               # list connected machines
-omp-teleport operators                        # list operator tokens
-omp-teleport config                           # print resolved relay URL + operator token
+omp-teleport start                         # start the relay in the foreground
+omp-teleport token <label> [ttl_sec]       # issue a join token, print the install URL
+omp-teleport install-url <label> [ttl_sec] # same but only print the URL
+omp-teleport ls                            # list connected machines
+omp-teleport operators                     # list operator tokens
+omp-teleport config                        # print resolved relay URL + operator token
+```
+
+## Explicit relay (skip auto-spawn)
+
+If you'd rather run the relay as a separate process (cloud server,
+shared team relay, systemd unit):
+
+```bash
+export OMP_REMOTE_RELAY=https://relay.example.com
+omp
+```
+
+To run the relay standalone:
+
+```bash
+cd relay
+bun install
+bun run src/index.ts
 ```
 
 ## Environment
@@ -278,92 +152,86 @@ omp-teleport config                           # print resolved relay URL + opera
 | Var | Default | Notes |
 |---|---|---|
 | `OMP_REMOTE_RELAY` | (auto-spawn) | explicit relay URL; skips auto-spawn when set |
-| `OMP_REMOTE_TOKEN` | (auto-discover) | operator token for the extension / CLI |
+| `OMP_REMOTE_TOKEN` | (not set) | operator token for the extension / CLI |
 | `OMP_REMOTE_PORT` | `7777` | port for the auto-spawned relay |
 | `OMP_REMOTE_BIND` | `0.0.0.0` | bind address for the auto-spawned relay |
-| `OMP_REMOTE_PUBLIC_URL` | (auto-detect) | base URL embedded in install URLs |
+| `OMP_REMOTE_PUBLIC_URL` | (empty) | base URL embedded in install URLs |
 | `OMP_REMOTE_STATE_DIR` | `~/.omp-teleport` | where the relay persists tokens + machine list |
 | `OMP_REMOTE_RELAY_ENTRY` | (auto-detect) | path to `relay/src/index.ts` for the auto-spawn |
 | `OMP_REMOTE_LABEL` | hostname | label for the connector (install side) |
+| `OMP_REMOTE_INSTALL_DIR` | `~/.omp-teleport` | connector install directory |
 
-## Running the smoke tests
+## Architecture
+
+```
+connector.py (Python)              relay (Bun)                 harness (OMP, Claude Code, …)
+       │                                │                                 │
+       │   WS /ws/connector             │                                 │
+       │ ──────────────────────────────►│                                 │
+       │                                │                                 │
+       │   {type:"register",label,…}    │                                 │
+       │ ──────────────────────────────►│                                 │
+       │                                │                                 │
+       │   {type:"tool.call",…}         │                                 │
+       │ ◄──────────────────────────────│                                 │
+       │                                │                                 │
+       │   {type:"tool.result",…}       │                                 │
+       │ ──────────────────────────────►│                                 │
+       │                                │                                 │
+       │                                │  MCP at /mcp                    │
+       │                                │ ◄────────────────────────────── │
+       │                                │  (tools/list, tools/call)       │
+       │                                │ ──────────────────────────────►│
+```
+
+## Wire protocol
+
+| Surface | Endpoint | Format |
+|---|---|---|
+| Connector ↔ relay | WebSocket `/ws/connector` | JSON text frames |
+| Harness ↔ relay | HTTP `/mcp` | JSON-RPC 2.0 (MCP Streamable HTTP) |
+| Extension ↔ relay | HTTP `/api/*` | JSON over HTTP |
+
+## Tool surface
+
+The connector implements nine tools. All return
+`{content: [{type: "text", text: "..."}], ok: bool}`:
+
+| Tool | Args | Result |
+|---|---|---|
+| `bash` | `command`, `cwd?`, `timeout?` (sec, default 30) | combined stdout+stderr + `[exit: N]` |
+| `read` | `path`, `offset?`, `limit?` (bytes) | file contents (capped at 4MB) |
+| `write` | `path`, `content` | `"wrote N bytes to {path}"` |
+| `edit` | `path`, `old_text`, `new_text`, `replace_all?` | `"patched"` |
+| `glob` | `pattern`, `cwd?` | newline-separated paths |
+| `grep` | `pattern`, `path`, `include?`, `max_count?` | `path:line:match` lines |
+| `ls` | `path` | `kind size name` lines |
+| `stat` | `path` | one-line summary |
+| `env` | `name?` | single value or all env |
+
+MCP tool names are `<safeLabel>__<tool>` (e.g. `prod_db__bash`).
+Extension names are `remote_<tool>` with a `machine` arg.
+
+## HTTP endpoints
+
+| Route | Method | Description |
+|---|---|---|
+| `/sh` | GET | Shell install script (Linux/macOS/Android) |
+| `/psh` | GET | PowerShell install script (Windows) |
+| `/connector.py` | GET | Connector source |
+| `/mcp` | GET/POST | MCP Streamable HTTP server (defined but not yet routed) |
+| `/ws/connector` | WS | Connector WebSocket |
+| `/health` | GET | `{"ok":true, "machines":N, "online":N}` |
+| `/api/machines` | GET | List connected machines |
+| `/api/tools/call` | POST | Invoke a tool on a machine |
+
+## Running smoke tests
 
 ```bash
-# 1. Manual relay mode (starts relay explicitly):
+# Manual relay mode:
 bash scripts/smoke.sh
 
-# 2. Auto-spawn mode (no manual relay start; the extension spawns one):
+# Auto-spawn mode:
 bash scripts/smoke-autospawn.sh
 bash scripts/smoke-autospawn-e2e.sh
 ```
-
-`smoke.sh` starts the relay, drops a connector that registers as
-`prod-db`, exercises all nine tools over both HTTP and MCP, and prints
-the result.
-
-## v0.3 changelog
-
-- **Auto-spawn relay as the default.** If `OMP_REMOTE_RELAY` isn't
-  set, the extension spawns a local relay on first use and tears it
-  down with the session. The relay binds `0.0.0.0:7777` by default
-  (was `127.0.0.1`) and the public base URL is auto-detected from the
-  box's primary network interface. Override with `OMP_REMOTE_PUBLIC_URL`
-  for tunneled/cloud setups.
-- **Explicit-mode support.** Set `OMP_REMOTE_RELAY` to a running
-  relay (cloud, shared, systemd) and the extension skips auto-spawn.
-- **`OMP_REMOTE_RELAY_ENTRY`** env var to point the auto-spawn at a
-  custom path for `relay/src/index.ts`.
-
-## v0.4 changelog
-
-- **Active-machine mode with tool-registry filtering.** `/tp
-  connect <machine>` now enters a remote-only mode that physically
-  hides local filesystem tools (bash, read, write, edit, glob, grep,
-  ls, stat, env, plus browser, debug, eval, lsp, ast_grep, ast_edit,
-  task, job, irc) from the model via `setActiveTools`. The model
-  literally cannot call them. The remote tools (`remote_*`) and a
-  small set of safe globals (ask, resolve, todo, web_search, etc.)
-  remain. `/tp disconnect` restores the full local tool set.
-- **Optional `machine` arg.** With an active remote connection, the
-  `machine` argument on every `remote_*` tool becomes optional and
-  defaults to the active machine. In default mode the model still
-  sees both local and remote tools and can call either; the user
-  uses `/tp pick` to inject a `machine: "<label>"` token into
-  the editor.
-- **No system-prompt manipulation.** The model is not told it is on
-  the remote; the tools and their results are the only source of
-  truth. Architecture alone enforces the boundary.
-
-## v0.2 changelog
-
-- TUI status widget above the editor: shows relay URL and the live
-  list of online machines. Updates on every connect/disconnect via
-  the relay's SSE event stream.
-- `/tp pick` — interactive machine picker; injects
-  `machine: "<label>" ` into the editor.
-- Cancellation plumbing end-to-end: OMP signal → extension fetch
-  abort → relay `req.signal.abort` → connector `tool.cancel` over WS.
-- Fixed label-lookup inconsistency: HTTP and MCP APIs both normalize
-  via `safeLabel` so `prod-db` and `prod_db` both resolve to the same
-  machine.
-
-## What's not here yet
-
-Deferred to v0.4+:
-- **Streaming output** for long-running bash. The connector can
-  stream per-line via `tool.progress` frames; plumbing through the
-  relay to the harness (OMP `onUpdate`, MCP streamable response) is
-  the next piece. The relay currently buffers to a single final
-  result.
-- **PTY support** for interactive bash.
-- **File upload/download** tools.
-- **Authenticated WebSocket** for operator tokens (join-only today).
-- **Persisted machine identity** on the remote (connector forgets
-  machine-id on restart; reconnect gets a new one).
-- **systemd / launchd** install scripts.
-- **Tunnel auto-setup** (e.g., spawn `cloudflared` and surface the
-  public URL).
-
-## License
-
-Pick your favorite; this is a reference implementation.
