@@ -1,0 +1,19 @@
+{
+  "name": "omp-teleport-relay",
+  "version": "0.1.0",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "OMP_REMOTE_LOG=1 bun --hot run src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.5.0"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "name": "omp-teleport",
+  "module": "omp-teleport.ts",
+  "type": "module",
+  "private": true,
+  "bin": "omp-teleport.ts"
+}
