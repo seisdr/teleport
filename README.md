@@ -27,8 +27,8 @@ your harness (OMP, Claude Code, …)
 - **An OMP extension** (`agent/omp-teleport.ts`) that registers
   `remote_bash`, `remote_read`, `remote_write`, `remote_edit`,
   `remote_glob`, `remote_grep`, `remote_ls`, `remote_stat`,
-  `remote_env` and forwards each call to the relay. Plus `/tp` and
-  `/psh` slash commands and a live status widget above the editor.
+  `remote_env` and forwards each call to the relay. Plus `/tp`
+  slash command and a live status widget above the editor.
 - **A CLI** (`cli/omp-teleport.ts`) to manage a separately-run relay
   (issue join tokens, list machines, print config).
 - **An MCP server** at `/mcp` (defined but not yet routed) so any
@@ -109,14 +109,6 @@ needed. Requires PowerShell 5.1+ (ships with Windows 10+).
 | `/tp refresh` | re-poll the machine list |
 | `/tp restart` | reconnect to the relay |
 | `/tp force [on\|off]` | toggle force mode: use short names (bash, read, etc.) as aliases to remote tools |
-
-### `/psh` — Windows installer info
-
-| Subcommand | Effect |
-|---|---|
-| `/psh` | show the Windows install URL |
-| `/psh url` | same |
-| `/psh help` | show detailed help |
 
 ## CLI
 
