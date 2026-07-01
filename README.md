@@ -50,16 +50,18 @@ See [PROTOCOL.md](PROTOCOL.md) for the full wire spec.
 
 | Route | Method | Description |
 |---|---|---|
-| `/sh` | GET | Shell install script (Linux/macOS/Termux) |
-| `/psh` | GET | PowerShell install script (Windows) |
+| `/sh` | GET | Shell install script (Linux/macOS/Termux) — tokenless |
+| `/psh` | GET | PowerShell install script (Windows) — tokenless |
 | `/connector.py` | GET | Connector source (fetched by installer) |
-| `/ws/connector` | WS | Connector WebSocket |
-| `/mcp` | POST | MCP Streamable HTTP (JSON-RPC 2.0) |
+| `/ws/connector` | WS | Connector WebSocket upgrade |
+| `/mcp` | POST | MCP JSON-RPC 2.0 (tools/list, tools/call) |
+| `/mcp` | GET | MCP SSE stream |
 | `/health` | GET | `{"ok":true, "machines":N, "online":N}` |
-| `/api/machines` | GET | List all machines with status |
-| `/api/tools/call` | POST | Invoke a tool on a specific machine |
-| `/api/events` | GET | SSE stream of machine connect/disconnect events |
-
+| `/api/machines` | GET | All machines: id, label, hostname, os, arch, status, capabilities |
+| `/api/tools/call` | POST | Call a tool on a machine: `{"name":"label__tool","arguments":{}}` |
+| `/api/tokens` | POST | Create join token → `{token:{secret,label,...}, install_url:".../sh"}` |
+| `/api/operators` | GET | List operator tokens |
+| `/api/events` | GET | SSE stream: `machine_connected`, `machine_disconnected` |
 ## Available tools
 
 `bash`, `read`, `write`, `edit`, `glob`, `grep`, `ls`, `stat`, `env`
