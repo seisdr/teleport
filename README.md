@@ -1,3 +1,5 @@
+> Full docs at [seisdr.github.io/teleport](https://seisdr.github.io/teleport)
+
 # teleport
 
 Run tools on remote machines via HTTP. One relay, many connectors, zero inbound ports.
@@ -23,7 +25,6 @@ Every connected machine shows up with a unique ID (`m_<base64url>`) and label. T
 ```bash
 # Terminal 1: start relay
 cd relay && bun install && bun run src/index.ts
-
 # Target machine: paste the one-liner
 curl -sSL 'http://<relay>:7777/sh' | sh -
 # or on Windows:
