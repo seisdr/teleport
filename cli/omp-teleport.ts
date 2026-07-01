@@ -14,7 +14,19 @@ interface CliConfig {
 
 function loadConfig(allowBootstrap = false): CliConfig {
 	const relay = process.env.OMP_REMOTE_RELAY ?? "http://127.0.0.1:7777";
-	const token = process.env.OMP_REMOTE_TOKEN ?? "";
+	let token = process.env.OMP_REMOTE_TOKEN ?? "";
+	if (!token) {
+		const statePath = process.env.OMP_REMOTE_STATE_DIR ?? join(homedir(), ".omp-teleport", "state.json");
+		if (existsSync(statePath)) {
+			try {
+				const data = JSON.parse(readFileSync(statePath, "utf8")) as { operatorTokens: Array<{ name: string; secret: string }> };
+				const op = data.operatorTokens[0];
+				if (op) {
+					token = op.secret;
+				}
+			} catch {}
+		}
+	}
 	if (!relay) {
 		console.error("error: OMP_REMOTE_RELAY not set");
 		process.exit(2);
@@ -150,7 +162,7 @@ const HELP_TEXT = `usage: omp-teleport <subcommand> [args]
 subcommands:
   start                            start the relay in the foreground
   token <label> [ttl_sec]          issue a join token; print the install URL
-  install-url <label> [ttl_sec]    same as 'token' but only print the URL
+  install-url [label] [ttl_sec]    print tokenless install one-liner
   ls | machines                    list connected machines
   operators                        list operator tokens
   config                           print resolved relay URL + operator token
@@ -194,8 +206,9 @@ async function main(): Promise<void> {
 		case "install-url": {
 			const label = rest[0];
 			if (!label) {
-				console.error("usage: omp-teleport install-url <label> [ttl_sec]");
-				process.exit(2);
+				const cfg = loadConfig(true);
+				console.log(`${cfg.relay}/sh`);
+				return;
 			}
 			const ttl = rest[1] ? Number.parseInt(rest[1], 10) : undefined;
 			await cmdToken(label, ttl, true);

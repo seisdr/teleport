@@ -50,4 +50,36 @@ run("stat", {"path": wp})
 run("env", {"name": "PATH"})
 os.unlink(tp)
 os.unlink(wp)
+
+# --- concurrency limit ---
+print(f"--- max_concurrent (limit={c.MAX_CONCURRENT}) ---")
+
+class MockWS:
+    def __init__(self):
+        self.sent = []
+        self.closed = False
+    def send(self, data):
+        self.sent.append(data)
+    def close(self, code=1000, reason=""):
+        self.closed = True
+
+conn = c.Connector("ws://x", None, "test")
+# Fill active_calls to MAX_CONCURRENT
+for i in range(c.MAX_CONCURRENT):
+    conn._active_calls[f"t_{i}"] = (threading.Event(), threading.Thread(target=lambda: None))
+
+ws = MockWS()
+# Send one more — should be rejected
+conn._handle(ws, {"type": "tool.call", "id": "t_over", "name": "bash",
+                    "args": {"command": "echo hi"}})
+
+rejected = [m for m in ws.sent if isinstance(m, dict) and m.get("type") == "tool.result" and not m.get("ok")]
+assert len(rejected) == 1, f"expected 1 rejection, got {len(rejected)}"
+assert "too many concurrent" in rejected[0]["error"], f"unexpected error: {rejected[0].get('error')}"
+print(f"  rejected correctly: {rejected[0]['error']}")
+
+# Clean up active calls so Connector can shut down
+conn._active_calls.clear()
+print("  OK")
+
 print("DONE")

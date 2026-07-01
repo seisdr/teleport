@@ -3,7 +3,7 @@
 import type { ServerWebSocket, WebSocketHandler } from "bun";
 import { z } from "zod";
 import type { Store } from "./store.ts";
-import type { ConnectorFrame, MachineRecord, PendingCall, TimerHandle, ToolResultFrame } from "./types.ts";
+import type { ConnectorFrame, MachineRecord, PendingCall, PingFrame, TimerHandle, ToolResultFrame } from "./types.ts";
 
 const HEARTBEAT_MS = 5000;
 
@@ -60,12 +60,6 @@ interface SessionState {
 	heartbeat: TimerHandle;
 }
 
-export function handleConnectorUpgrade(
-	_req: Request,
-	_store: Store,
-): { ok: true; ctx: WSContext } {
-	return { ok: true, ctx: {} };
-}
 
 export function createConnectorHandler(store: Store): WebSocketHandler<WSContext> {
 	const sessions = new WeakMap<ServerWebSocket<WSContext>, SessionState>();
@@ -158,7 +152,7 @@ export function createConnectorHandler(store: Store): WebSocketHandler<WSContext
 
 
 			if (frame.type === "ping") {
-				const t = typeof (frame as Record<string, unknown>).t === "number" ? (frame as Record<string, unknown>).t : Date.now();
+			const t = (frame as PingFrame).t ?? Date.now();
 				try {
 					ws.send(JSON.stringify({ type: "pong", t }));
 				} catch {

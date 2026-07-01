@@ -33,73 +33,241 @@ import struct
 import subprocess
 import sys
 import threading
+from queue import Queue, Empty
 import time
 import traceback
 import urllib.parse
 import uuid
 
 
-def _read_hwid() -> str:
-	"""Deterministic hardware ID. Same machine always returns the same value."""
-	# Windows: use MachineGuid from registry
-	if sys.platform == "win32":
+# ---------- WebSocket client (stdlib only, RFC 6455) ----------
+
+class WSError(Exception):
+	"""WebSocket protocol error."""
+	pass
+
+
+class Cancelled(Exception):
+	"""Raised when a tool call is cancelled."""
+	pass
+
+
+class ToolCtx:
+	"""Context passed to tool functions for cancellation and progress reporting."""
+	__slots__ = ("cancel_event", "on_progress")
+
+	def __init__(self, cancel_event: threading.Event, on_progress=None):
+		self.cancel_event = cancel_event
+		self.on_progress = on_progress
+
+	def emit_progress(self, delta: str) -> None:
+		if self.on_progress:
+			self.on_progress(delta)
+
+# ---------- Constants ----------
+
+VERSION = "0.5.0"
+HEARTBEAT_INTERVAL_MS = 5000
+RECONNECT_BACKOFF = [1, 2, 4, 8, 16, 30]
+DEFAULT_BASH_TIMEOUT = 30
+MAX_BASH_TIMEOUT = 3600
+MAX_STDOUT = 50000
+MAX_STDERR = 10000
+MAX_TOOL_RESULT_BYTES = 100000
+MAX_READ_BYTES = 5242880
+MAX_CONCURRENT = 4
+
+
+# ---------- WebSocket frame helpers ----------
+
+_WS_MAGIC = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _ws_mask(payload: bytes, mask_key: bytes) -> bytes:
+	return bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+
+
+class WebSocket:
+	"""Minimal RFC 6455 WebSocket client for JSON text frames. Stdlib only."""
+
+	def __init__(self, sock: socket.socket):
+		self._sock = sock
+		self._recv_buf = bytearray()
+		self.closed = False
+
+	@staticmethod
+	def connect(url: str, headers: dict[str, str] | None = None, timeout: float = 15) -> "WebSocket":
+		parsed = urllib.parse.urlparse(url)
+		if parsed.scheme not in ("ws", "wss"):
+			raise WSError(f"unsupported scheme: {parsed.scheme}")
+		host = parsed.hostname
+		port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+		path = parsed.path or "/"
+		if parsed.query:
+			path += "?" + parsed.query
+
+		sock = socket.create_connection((host, port), timeout=timeout)
+		if parsed.scheme == "wss":
+			ctx = ssl.create_default_context()
+			sock = ctx.wrap_socket(sock, server_hostname=host)
+
+		# HTTP upgrade handshake
+		key = base64.b64encode(os.urandom(16)).decode()
+		req_lines = [
+			f"GET {path} HTTP/1.1",
+			f"Host: {host}:{port}",
+			"Upgrade: websocket",
+			"Connection: Upgrade",
+			f"Sec-WebSocket-Key: {key}",
+			"Sec-WebSocket-Version: 13",
+		]
+		if headers:
+			for k, v in headers.items():
+				req_lines.append(f"{k}: {v}")
+		req_lines.append("")
+		req_lines.append("")
+		sock.sendall("\r\n".join(req_lines).encode())
+
+		# Read response
+		resp = b""
+		while b"\r\n\r\n" not in resp:
+			chunk = sock.recv(4096)
+			if not chunk:
+				raise WSError("connection closed during handshake")
+			resp += chunk
+		header_end = resp.index(b"\r\n\r\n")
+		status_line = resp[:resp.index(b"\r\n")].decode()
+		if " 101 " not in status_line and not status_line.startswith("HTTP/1.1 101"):
+			raise WSError(f"handshake failed: {status_line}")
+
+		# Validate accept key
+		expected_accept = base64.b64encode(
+			hashlib.sha1(key.encode() + _WS_MAGIC).digest()
+		).decode()
+		response_headers = resp[:header_end].decode().split("\r\n")[1:]
+		got_accept = ""
+		for h in response_headers:
+			if h.lower().startswith("sec-websocket-accept:"):
+				got_accept = h.split(":", 1)[1].strip()
+		if got_accept != expected_accept:
+			raise WSError(f"Sec-WebSocket-Accept mismatch: expected {expected_accept}, got {got_accept}")
+
+		return WebSocket(sock)
+
+	def send(self, data: object) -> None:
+		"""Send a JSON text frame."""
+		payload = json.dumps(data, ensure_ascii=False).encode()
+		self._send_frame(0x1, payload)
+
+	def recv(self) -> dict | None:
+		"""Receive and parse a JSON text frame. Returns None if connection closed cleanly."""
+		while True:
+			data = self._recv_frame()
+			if data is None:
+				return None
+			opcode, payload = data
+			if opcode == 0x1:  # text
+				return json.loads(payload.decode())
+			if opcode == 0x8:  # close
+				self.closed = True
+				return None
+			if opcode == 0x9:  # ping
+				self._send_frame(0xA, payload)
+			# pong (0xA) and other frames: ignore
+
+	def close(self, code: int = 1000, reason: str = "") -> None:
+		"""Send close frame and shutdown."""
+		if self.closed:
+			return
 		try:
-			import winreg
-			key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography")
-			guid, _ = winreg.QueryValueEx(key, "MachineGuid")
-			winreg.CloseKey(key)
-			if guid:
-				return hashlib.sha256(guid.encode()).hexdigest()[:16]
-		except Exception:
-			pass
-		# Fallback: hash of hostname + MAC via uuid
-		try:
-			mac = uuid.getnode()
-			raw = socket.gethostname() + str(mac)
-			return hashlib.sha256(raw.encode()).hexdigest()[:16]
-		except Exception:
-			return hashlib.sha256(socket.gethostname().encode()).hexdigest()[:16]
-	
-	# macOS: use IOPlatformUUID
-	if sys.platform == "darwin":
-		try:
-			r = subprocess.run(["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
-			                   capture_output=True, text=True, timeout=5)
-			for line in r.stdout.splitlines():
-				if "IOPlatformUUID" in line:
-					return line.split('"')[1] if '"' in line else line.split("=")[1].strip()
-		except Exception:
-			pass
-	
-	# Linux: use machine-id
-	try:
-		for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
-			if os.path.exists(p):
-				with open(p) as f:
-					hwid = f.read().strip()
-				if hwid:
-					return hwid
-	except Exception:
-		pass
-	
-	# Fallback: hash of hostname + MAC
-	try:
-		mac = ""
-		if sys.platform == "linux":
-			for iface in sorted(os.listdir("/sys/class/net/")):
-				p = f"/sys/class/net/{iface}/address"
-				if os.path.exists(p):
-					with open(p) as f:
-						m = f.read().strip()
-					if m and m != "00:00:00:00:00:00":
-						mac = m
-						break
+			try:
+				payload = struct.pack("!H", code) + reason.encode()
+				self._send_frame(0x8, payload)
+			except Exception:
+				pass
+			try:
+				self._sock.shutdown(socket.SHUT_RDWR)
+			except OSError:
+				pass
+		finally:
+			try:
+				self._sock.close()
+			except OSError:
+				pass
+			self.closed = True
+	# ---- internal framing ----
+
+	def _send_frame(self, opcode: int, payload: bytes) -> None:
+		mask_key = os.urandom(4)
+		header = bytearray([0x80 | opcode])
+		length = len(payload)
+		if length < 126:
+			header.append(0x80 | length)
+		elif length < 65536:
+			header.append(0x80 | 126)
+			header += struct.pack("!H", length)
 		else:
-			mac = str(uuid.getnode())
-		raw = socket.gethostname() + mac
-		return hashlib.sha256(raw.encode()).hexdigest()[:16]
-	except Exception:
-		return hashlib.sha256(socket.gethostname().encode()).hexdigest()[:16]
+			header.append(0x80 | 127)
+			header += struct.pack("!Q", length)
+		header += mask_key
+		self._sock.sendall(bytes(header) + _ws_mask(payload, mask_key))
+
+	def _recv_frame(self) -> tuple[int, bytes] | None:
+		"""Read one frame. Returns (opcode, payload) or None on close/error."""
+		# Read header (at least 2 bytes)
+		while len(self._recv_buf) < 2:
+			try:
+				chunk = self._sock.recv(4096)
+			except OSError:
+				self.closed = True
+				return None
+			if not chunk:
+				self.closed = True
+				return None
+			self._recv_buf += chunk
+
+		b0 = self._recv_buf[0]
+		b1 = self._recv_buf[1]
+		opcode = b0 & 0xF
+		masked = (b1 & 0x80) != 0
+		length = b1 & 0x7F
+		pos = 2
+
+		if length == 126:
+			while len(self._recv_buf) < pos + 2:
+				chunk = self._sock.recv(4096)
+				if not chunk:
+					self.closed = True
+					return None
+				self._recv_buf += chunk
+			length = struct.unpack("!H", bytes(self._recv_buf[pos:pos+2]))[0]
+			pos += 2
+		elif length == 127:
+			while len(self._recv_buf) < pos + 8:
+				chunk = self._sock.recv(4096)
+				if not chunk:
+					self.closed = True
+					return None
+				self._recv_buf += chunk
+			length = struct.unpack("!Q", bytes(self._recv_buf[pos:pos+8]))[0]
+			pos += 8
+
+		header_len = pos + (4 if masked else 0)
+		while len(self._recv_buf) < header_len + length:
+			chunk = self._sock.recv(4096)
+			if not chunk:
+				self.closed = True
+				return None
+			self._recv_buf += chunk
+
+		mask_key = bytes(self._recv_buf[pos:pos+4]) if masked else b""
+		pos += 4 if masked else 0
+		payload = bytes(self._recv_buf[pos:pos+length])
+		if masked:
+			payload = _ws_mask(payload, mask_key)
+
+		self._recv_buf = self._recv_buf[pos+length:]
+		return (opcode, payload)
 
 def _truncate(text: str, n: int = 200) -> str:
 	return text if len(text) <= n else text[:n] + f"\n[truncated {len(text) - n} bytes]"
@@ -120,16 +288,13 @@ def _tool_summary(name: str, args: dict) -> str:
 	return ""
 
 
-import threading
-from queue import Queue, Empty
-
 def tool_bash(args: dict, ctx: ToolCtx) -> tuple[list[dict], bool]:
 	command = args.get("command")
 	if not isinstance(command, str) or not command.strip():
 		raise ValueError("bash.command must be a non-empty string")
 	cwd = args.get("cwd") or os.getcwd()
 	timeout = int(args.get("timeout") or DEFAULT_BASH_TIMEOUT)
-	timeout = max(1, min(timeout, MAX_BASH_TIMEOUT))
+	timeout = max(1, timeout)
 
 	if not os.path.isdir(cwd):
 		raise FileNotFoundError(f"cwd not found: {cwd}")
@@ -223,6 +388,9 @@ def tool_bash(args: dict, ctx: ToolCtx) -> tuple[list[dict], bool]:
 			if proc.poll() is None:
 				proc.kill()
 			proc.wait(timeout=2)
+
+	if READER_ERROR[0] is not None:
+		chunks.append(f"\n[reader error: {READER_ERROR[0]}]")
 
 	if timed_out:
 		return [{
@@ -427,10 +595,69 @@ class Connector:
 		self.relay = relay
 		self.token = token
 		self.label = label or socket.gethostname()
-		self.machine_id = _read_hwid()
+		self.machine_id = Connector._read_hwid()
 		self._active_calls: dict[str, tuple[threading.Event, threading.Thread]] = {}
 		self._lock = threading.Lock()
 		self._stop = threading.Event()
+
+	@staticmethod
+	def _read_hwid() -> str:
+		"""Deterministic hardware ID in m_<base64url> format."""
+		raw = Connector._read_raw_hwid()
+		h = hashlib.sha256(raw.encode()).digest()
+		return "m_" + base64.urlsafe_b64encode(h[:9]).decode().rstrip("=")
+
+	@staticmethod
+	def _read_raw_hwid() -> str:
+		"""Platform-specific stable identifier, may vary in format."""
+		if sys.platform == "win32":
+			try:
+				import winreg
+				key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography")
+				guid, _ = winreg.QueryValueEx(key, "MachineGuid")
+				winreg.CloseKey(key)
+				if guid:
+					return guid
+			except Exception:
+				pass
+			try:
+				return socket.gethostname() + str(uuid.getnode())
+			except Exception:
+				return socket.gethostname()
+		if sys.platform == "darwin":
+			try:
+				r = subprocess.run(["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+				                   capture_output=True, text=True, timeout=5)
+				for line in r.stdout.splitlines():
+					if "IOPlatformUUID" in line:
+						return line.split('"')[1] if '"' in line else line.split("=")[1].strip()
+			except Exception:
+				pass
+		try:
+			for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+				if os.path.exists(p):
+					with open(p) as f:
+						hwid = f.read().strip()
+					if hwid:
+						return hwid
+		except Exception:
+			pass
+		try:
+			mac = ""
+			if sys.platform == "linux":
+				for iface in sorted(os.listdir("/sys/class/net/")):
+					p = f"/sys/class/net/{iface}/address"
+					if os.path.exists(p):
+						with open(p) as f:
+							m = f.read().strip()
+						if m and m != "00:00:00:00:00:00":
+							mac = m
+							break
+			else:
+				mac = str(uuid.getnode())
+			return socket.gethostname() + mac
+		except Exception:
+			return socket.gethostname()
 
 	def run_forever(self) -> None:
 		backoff = 0
@@ -521,6 +748,10 @@ class Connector:
 			args = msg.get("args") or {}
 			if not cid or not name:
 				return
+			if name == "bash":
+				timeout_ms = msg.get("timeout_ms")
+				if timeout_ms is not None:
+					args["timeout"] = min(timeout_ms / 1000, 3600)
 			if name not in TOOLS:
 				ws.send({"type": "tool.result", "id": cid, "ok": False,
 				         "error": f"unknown tool: {name}", "content": []})
@@ -530,6 +761,10 @@ class Connector:
 				target=self._exec, args=(ws, cid, name, args, ev), daemon=True
 			)
 			with self._lock:
+				if len(self._active_calls) >= MAX_CONCURRENT:
+					ws.send({"type": "tool.result", "id": cid, "ok": False,
+					         "error": f"too many concurrent calls (max {MAX_CONCURRENT})", "content": []})
+					return
 				self._active_calls[cid] = (ev, th)
 			th.start()
 			return
@@ -631,6 +866,8 @@ def main() -> int:
 	p = argparse.ArgumentParser(prog="omp-teleport-connector")
 	p.add_argument("--relay", default=os.environ.get("OMP_REMOTE_RELAY"),
 	               help="relay ws URL (env: OMP_REMOTE_RELAY)")
+	p.add_argument("--token", default=os.environ.get("OMP_REMOTE_TOKEN"),
+	               help="join token (env: OMP_REMOTE_TOKEN)")
 	p.add_argument("--label", default=os.environ.get("OMP_REMOTE_LABEL"),
 	               help="friendly machine label")
 	p.add_argument("--install-dir", default=os.path.expanduser("~/.omp-teleport"),
@@ -642,12 +879,15 @@ def main() -> int:
 		return 2
 
 	os.makedirs(args.install_dir, exist_ok=True)
+	token = args.token or os.environ.get("OMP_REMOTE_TOKEN")
 	with open(os.path.join(args.install_dir, "env"), "w") as f:
 		f.write(f"OMP_REMOTE_RELAY={args.relay}\n")
 		if args.label:
 			f.write(f"OMP_REMOTE_LABEL={args.label}\n")
+		if token:
+			f.write(f"OMP_REMOTE_TOKEN={token}\n")
 
-	c = Connector(args.relay, None, args.label)
+	c = Connector(args.relay, token, args.label)
 
 	def stop(*_a):
 		c._stop.set()

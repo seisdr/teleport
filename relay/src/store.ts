@@ -31,6 +31,9 @@ export class Store {
 	constructor(persistPath: string) {
 		this.persistPath = persistPath;
 		this.load();
+		if (this.operators.size === 0) {
+			this.createOperator("default");
+		}
 	}
 
 	private load(): void {
@@ -195,11 +198,7 @@ export class Store {
 			call.reject(new Error("machine disconnected"));
 		}
 		m.pendingCalls.clear();
+		this.notify("machine_disconnected", id);
 	}
 
-	generateMachineId(): string {
-		const bytes = new Uint8Array(9);
-		crypto.getRandomValues(bytes);
-		return `m_${Buffer.from(bytes).toString("base64url")}`;
-	}
 }

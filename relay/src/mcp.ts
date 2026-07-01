@@ -270,6 +270,7 @@ export async function handleMcpRequest(req: Request, store: Store): Promise<Resp
 
 	if (req.method === "GET") {
 		// Open SSE listener for server-initiated notifications.
+		let unsub: (() => void) | null = null;
 		const stream = new ReadableStream<Uint8Array>({
 			start(controller) {
 				const enc = new TextEncoder();
@@ -282,17 +283,23 @@ export async function handleMcpRequest(req: Request, store: Store): Promise<Resp
 				};
 				// Initial endpoint event (matches legacy MCP behavior, optional)
 				controller.enqueue(enc.encode(`event: endpoint\ndata: /mcp\n\n`));
-				store.onMachinesChange((reason) => {
+				unsub = store.onMachinesChange((reason) => {
 					send({ jsonrpc: "2.0", method: "notifications/tools/list_changed", params: { reason } });
 				});
-				// Hold the connection open until client closes.
-				req.signal.addEventListener("abort", () => {
+				const cleanup = () => {
+					unsub?.();
+					unsub = null;
 					try {
 						controller.close();
 					} catch {
 						// already closed
 					}
-				});
+				};
+				req.signal.addEventListener("abort", cleanup);
+			},
+			cancel() {
+				unsub?.();
+				unsub = null;
 			},
 		});
 		return new Response(stream, {

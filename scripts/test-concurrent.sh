@@ -52,12 +52,14 @@ echo
 echo "=== 4. multiple concurrent tool calls: 3 in parallel should overlap, not serialize ==="
 START=$(date +%s%N)
 # Fire 3 calls in background, each sleeps 1s
+PIDS=""
 for i in 1 2 3; do
 	curl -s -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $OP" \
 		-d "{\"name\":\"concurrent_test__bash\",\"arguments\":{\"command\":\"echo call$i; sleep 1; echo done$i\"}}" \
 		http://127.0.0.1:18777/api/tools/call > /tmp/concurrent-$i.json &
+	PIDS="$PIDS $!"
 done
-wait
+wait $PIDS
 END=$(date +%s%N)
 ELAPSED=$(( (END - START) / 1000000 ))
 echo "  3 concurrent sleep-1s calls: elapsed=${ELAPSED}ms (expected ~1000-1500ms, NOT 3000ms)"
@@ -70,16 +72,20 @@ done
 echo
 echo "=== 5. different tool types concurrently ==="
 # bash + read at the same time
+START2=$(date +%s%N)
 {
 	curl -s -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $OP" \
 		-d '{"name":"concurrent_test__bash","arguments":{"command":"sleep 1; echo bash-done"}}' \
 		http://127.0.0.1:18777/api/tools/call > /tmp/c-bash.json &
+	PID1=$!
 	curl -s -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $OP" \
 		-d '{"name":"concurrent_test__read","arguments":{"path":"/etc/hostname"}}' \
 		http://127.0.0.1:18777/api/tools/call > /tmp/c-read.json &
-	wait
+	PID2=$!
+	wait $PID1 $PID2
 }
-ELAPSED=$(( ( $(date +%s%N) - $(date +%s%N) + 1500000000 ) / 1000000 ))
+END2=$(date +%s%N)
+ELAPSED2=$(( (END2 - START2) / 1000000 ))
 ok1=$(python3 -c "import json; print(json.load(open('/tmp/c-bash.json')).get('ok'))" 2>/dev/null)
 ok2=$(python3 -c "import json; print(json.load(open('/tmp/c-read.json')).get('ok'))" 2>/dev/null)
 echo "  bash: ok=$ok1"

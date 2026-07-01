@@ -37,6 +37,7 @@ import { homedir } from "node:os";
 import { existsSync, realpathSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 interface MachineCapabilities {
 	tools: string[];
@@ -112,7 +113,8 @@ function findRelayEntry(): string | undefined {
 	const candidates: string[] = [];
 	if (process.env.OMP_REMOTE_RELAY_ENTRY) candidates.push(process.env.OMP_REMOTE_RELAY_ENTRY);
 	try {
-		const here = realpathSync(import.meta.path);
+		const meta = import.meta as unknown as { path?: string; filename?: string; url?: string };
+		const here = realpathSync(meta.path || meta.filename || (meta.url ? new URL(meta.url).pathname : ""));
 		const hereDir = dirname(here);
 		candidates.push(resolve(hereDir, "..", "relay", "src", "index.ts"));
 		candidates.push(resolve(hereDir, "..", "..", "relay", "src", "index.ts"));
@@ -164,6 +166,7 @@ interface ToolCallResult {
 }
 
 interface RelayClient {
+	relay: string;
 	listMachines(): Promise<Machine[]>;
 	callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolCallResult>;
 	callToolStream(
@@ -247,6 +250,7 @@ function makeClient(config: Config): RelayClient {
 	}
 
 	return {
+		relay: config.relay,
 		async listMachines() {
 			const r = await fetchOk("/api/machines", { method: "GET" });
 			if (!r.ok) throw new Error(`listMachines: HTTP ${r.status}: ${await r.text()}`);
@@ -325,7 +329,7 @@ function renderWidget(state: WidgetState): string[] {
 	} else {
 		lines.push(`omp-teleport · ${truncate(url, WIDGET_MAX_WIDTH - 24)} · ${online.length}/${total} online · /tp connect <label> for remote-only mode`);
 		if (online.length === 0) {
-			lines.push(total === 0 ? "  (no machines — /tp token <label> to mint an install URL)" : "  (no online machines)");
+			lines.push(total === 0 ? "  (no machines — /tp link to mint an install URL)" : "  (no online machines)");
 		} else {
 			for (const m of online.slice(0, MAX_WIDGET_LINES - 1)) {
 				lines.push(`  ● ${truncate(`${m.label} (${m.hostname}, ${m.os}/${m.arch})`, WIDGET_MAX_WIDTH - 4)}`);
@@ -457,9 +461,9 @@ export default function ompRemoteExtension(pi: ExtensionAPI): void {
 				const r = await fetch(`${relay}/api/events`, {
 					signal: ac.signal,
 				});
-				if (!r.ok || !r.body) {
-					continue;
-				}
+			if (!r.ok || !r.body) {
+				// fall through to reconnect delay
+			} else {
 				const reader = r.body.getReader();
 				const dec = new TextDecoder();
 				let buf = "";
@@ -483,9 +487,11 @@ export default function ompRemoteExtension(pi: ExtensionAPI): void {
 						}
 					}
 				}
+			}
 			} catch (e) {
 				if (e instanceof Error && e.name === "AbortError") return;
 			}
+			await sleep(2000);
 		}
 	}
 	pi.on("session_start", async (_e, ctx) => {
@@ -606,13 +612,29 @@ export default function ompRemoteExtension(pi: ExtensionAPI): void {
 	}
 
 	pi.registerCommand("tp", {
-		description: "Manage omp-teleport machines. Subcommands: ls, refresh, pick, connect <machine>, disconnect",
+		description: "Manage omp-teleport machines. Subcommands: ls, refresh, pick, connect <machine>, disconnect, link, help",
 		handler: async (args, ctx) => {
 			if (!client) {
 				ctx.ui.notify("omp-teleport: relay not initialized yet", "warn");
 				return;
 			}
 			const trimmed = args.trim();
+			if (trimmed === "help" || trimmed === "?") {
+				ctx.ui.notify(
+					"omp-teleport commands:\n\n" +
+					"  /tp ls                       — list connected machines\n" +
+					"  /tp pick                     — interactive machine picker\n" +
+					"  /tp connect <machine>        — enter remote-only mode (hides local tools)\n" +
+					"  /tp disconnect               — exit remote-only mode (restores local tools)\n" +
+					"  /tp link                     — print tokenless install one-liners\n" +
+					"  /tp force [on|off]           — toggle force mode (aliases short names to remote tools)\n" +
+					"  /tp refresh                  — re-poll machine list from relay\n" +
+					"  /tp restart                  — reconnect extension to relay\n" +
+					"  /tp help                     — show this help message",
+					"info"
+				);
+				return;
+			}
 			if (!trimmed || trimmed === "ls") {
 				try {
 					const machines = await client.listMachines();
@@ -659,7 +681,8 @@ export default function ompRemoteExtension(pi: ExtensionAPI): void {
 								"info",
 							);
 						} else {
-							ctx.ui.notify(`omp-teleport pick connect failed: ${res.reason}`, "error");
+							const errRes = res as { ok: false; reason: string };
+							ctx.ui.notify(`omp-teleport pick connect failed: ${errRes.reason}`, "error");
 						}
 					}
 				} catch (e) {
@@ -685,8 +708,23 @@ export default function ompRemoteExtension(pi: ExtensionAPI): void {
 						"info",
 					);
 				} else {
-					ctx.ui.notify(`omp-teleport connect failed: ${res.reason}`, "error");
+					const errRes = res as { ok: false; reason: string };
+					ctx.ui.notify(`omp-teleport connect failed: ${errRes.reason}`, "error");
 				}
+				return;
+			}
+			if (trimmed === "link") {
+				const base = client.relay;
+				const shUrl = `${base}/sh`;
+				const pshUrl = `${base}/psh`;
+				ctx.ui.notify(
+					`omp-teleport installer:\n\n` +
+					`Linux/macOS:\n` +
+					`  curl -sSL '${shUrl}' | sh -\n\n` +
+					`Windows (PowerShell):\n` +
+					`  powershell -ep bypass -c "irm '${pshUrl}' | iex"`,
+					"info"
+				);
 				return;
 			}
 			if (trimmed === "refresh") {
@@ -722,7 +760,7 @@ export default function ompRemoteExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify("omp-teleport: FORCE mode off — local tools restored", "info");
 				return;
 			}
-			ctx.ui.notify("usage: /tp ls | /tp pick | /tp refresh | /tp restart | /tp connect <machine> | /tp disconnect | /tp force [on/off]", "warn");
+			ctx.ui.notify("usage: /tp <subcommand>. Type /tp help for details.", "warn");
 		},
 	});
 

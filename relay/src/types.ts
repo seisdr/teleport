@@ -16,6 +16,7 @@ export interface ConnectorCapabilities {
 
 export interface RegisterFrame {
 	type: "register";
+	machine_id: string;
 	hostname: string;
 	os: string;
 	arch: string;

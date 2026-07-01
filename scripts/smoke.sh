@@ -33,21 +33,13 @@ fi
 OP_TOKEN=$(python3 -c "import json; print(json.load(open('$STATE_DIR/state.json'))['operatorTokens'][0]['secret'])")
 echo "  relay PID=$RELAY_PID op_token=$OP_TOKEN"
 
-echo
-echo "[2/6] omp-teleport install-url prod-db"
-INSTALL_URL=$(OMP_REMOTE_RELAY=http://127.0.0.1:$RELAY_PORT OMP_REMOTE_TOKEN=$OP_TOKEN \
-  bun cli/omp-teleport.ts install-url prod-db 2>&1 | tail -1)
-echo "  install URL: $INSTALL_URL"
-JOIN_TOKEN=$(echo "$INSTALL_URL" | sed 's/.*token=//')
 
 echo
-echo "[3/6] start connector"
+echo "[2/6] start connector"
 OMP_REMOTE_RELAY=ws://127.0.0.1:$RELAY_PORT/ws/connector \
-  OMP_REMOTE_TOKEN=$JOIN_TOKEN \
   OMP_REMOTE_LABEL=prod-db \
   python3 connector/connector.py \
     --relay ws://127.0.0.1:$RELAY_PORT/ws/connector \
-    --token "$JOIN_TOKEN" \
     --label prod-db \
     --install-dir "$INSTALL_DIR" \
   > "$LOG_DIR/connector.log" 2>&1 &
@@ -58,12 +50,12 @@ echo "  --- connector log ---"
 sed 's/^/  /' "$LOG_DIR/connector.log"
 
 echo
-echo "[4/6] omp-teleport ls"
+echo "[3/6] omp-teleport ls"
 OMP_REMOTE_RELAY=http://127.0.0.1:$RELAY_PORT OMP_REMOTE_TOKEN=$OP_TOKEN \
   bun cli/omp-teleport.ts ls
 
 echo
-echo "[5/6] tool calls via /api/tools/call (used by the OMP extension)"
+echo "[4/6] tool calls via /api/tools/call (used by the OMP extension)"
 
 call_tool() {
   local name="$1" args="$2" desc="$3"
@@ -101,26 +93,32 @@ call_tool "prod_db__bash"  '{"command":"exit 42"}' "bash nonzero"
 call_tool "no_such__bash"  '{"command":"x"}' "unknown machine"
 
 echo
-echo "[6/6] tool call via MCP protocol (for non-OMP harnesses)"
+echo "[5/6] tool call via MCP protocol (for non-OMP harnesses)"
 MCP_OUT=$(curl -s -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $OP_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"prod_db__bash","arguments":{"command":"echo MCP_OK"}}}' \
   "http://127.0.0.1:$RELAY_PORT/mcp")
 echo "$MCP_OUT" | python3 -c "
 import json, sys
 try:
-    d = json.load(sys.stdin)
-    if d.get('result'):
-        c = d['result'].get('content', [])
-        text = c[0].get('text','') if c else ''
-        print(f'  result.ok={d[\"result\"].get(\"isError\") is False} text={text!r}')
+    lines = sys.stdin.read().splitlines()
+    result_data = None
+    for line in lines:
+        if line.startswith('data: ') and '\"content\"' in line:
+            result_data = json.loads(line[6:])
+            break
+    if result_data:
+        c = result_data.get('content', [])
+        text = c[0].get('text', '') if c else ''
+        is_ok = result_data.get('ok', True) and not result_data.get('isError', False)
+        print(f'  result.ok={is_ok} text={text!r}')
     else:
-        print(f'  error: {d.get(\"error\")}')
+        print('  error: result not found in SSE stream')
 except Exception as e:
     print(f'  parse err: {e}')
 "
 
 echo
-echo "[7/6] tools/list via MCP"
+echo "[6/6] tools/list via MCP"
 TOOLS_OUT=$(curl -s -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $OP_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "http://127.0.0.1:$RELAY_PORT/mcp")
 echo "$TOOLS_OUT" | python3 -c "
